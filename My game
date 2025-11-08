@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Mini Open-World Prototype</title>
+<style>
+  html,body { height:100%; margin:0; overflow:hidden; background:#000; }
+  #overlay { position:fixed; left:10px; top:10px; color:#fff; font-family:system-ui,Segoe UI,Arial; z-index:10; }
+  #hud { position:fixed; right:10px; top:10px; color:#fff; font-family:system-ui; text-align:right; z-index:10; }
+  #instructions{ position:fixed; left:50%; transform:translateX(-50%); bottom:20px; color:#fff; background:rgba(0,0,0,0.4); padding:8px 12px; border-radius:6px;}
+  canvas{ display:block; }
+  button { font-size:14px; padding:6px 8px; }
+  a.small { color:#9cf; text-decoration:none; font-size:12px; display:block; margin-top:6px; }
+</style>
+</head>
+<body>
+<div id="overlay">
+  <div>Controls: WASD move • Shift run • Mouse look • Click to lock mouse • E enter/exit vehicle • Left click shoot</div>
+  <div style="margin-top:6px;">Tip: spawn near the red car box and press E to drive.</div>
+</div>
+<div id="hud">
+  <div id="health">Health: 100</div>
+  <div id="mode">Mode: On Foot</div>
+</div>
+<div id="instructions">Click the canvas to lock pointer and start. Esc to release.</div>
+
+<!-- three.js (r152+) UMD build from CDN -->
+<script src="https://unpkg.com/three@0.152.2/build/three.min.js"></script>
+
+<script>
+/*
+Mini Open-World Prototype (Three.js)
+- Third-person character (capsule-like)
+- Simple box 'car' you can enter and drive
+- NPCs (moving boxes)
+- Day/night cycle
+- Shooting (raycast hits NPCs)
+- Minimal HUD
+*/
+
+const { Scene, PerspectiveCamera, WebGLRenderer, Color, AmbientLight,
+        DirectionalLight, PlaneGeometry, MeshLambertMaterial, Mesh,
+        BoxGeometry, SphereGeometry, MeshStandardMaterial, Vector3,
+        Raycaster, Clock } = THREE;
+
+let scene, camera, renderer, clock;
+let player, playerObj, vehicle, inVehicle=false, vehicleObj;
+let npcs = [];
+let keys = {};
+let pointerLocked = false;
+let yaw = 0, pitch = 0;
+let mouseSensitivity = 0.0025;
+let raycaster = new Raycaster();
+let hudHealth = 100;
+
+init();
+animate();
+
+function init(){
+  clock = new Clock();
+  scene = new Scene();
+  scene.background = new Color(0x87ceeb);
+
+  // Camera (third-person)
+  camera = new PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 1000);
+
+  // Renderer
+  renderer = new WebGLRenderer({antialias:true});
+  renderer.setSize(innerWidth, innerHeight);
+  document.body.appendChild(renderer.domElement);
+
+  // Lights
+  const amb = new AmbientLight(0xffffff, 0.4);
+  scene.add(amb);
+  window.sun = new DirectionalLight(0xfff7e8, 1.0);
+  sun.position.set(30,60,10);
+  sun.castShadow = false;
+  scene.add(sun);
+
+  // Ground (grid-like)
+  const groundMat = new MeshStandardMaterial({color:0x2b7a2b, roughness:1});
+  const ground = new Mesh(new PlaneGeometry(400,400), groundMat);
+  ground.rotation.x = -Math.PI/2;
+  ground.receiveShadow = true;
+  scene.add(ground);
+
+  // Simple city blocks: boxes as buildings
+  const bMat = new MeshStandardMaterial({color:0x8b8b8b});
+  for(let i=-6;i<=6;i++){
+    for(let j=-6;j<=6;j++){
+      if(Math.abs(i)+Math.abs(j) < 3) continue;
+      const h = 4 + Math.random()*18;
+      const box = new Mesh(new BoxGeometry(6, h, 6), bMat.clone());
+      box.position.set(i*12 + (Math.random()-0.5)*4, h/2, j*12 + (Math.random()-0.5)*4);
+      box.material.roughness = 1;
+      scene.add(box);
+    }
+  }
+
+  // Player (simple capsule: cylinder approx with sphere head)
+  playerObj = new Mesh(new BoxGeometry(0.8,1.6,0.6), new MeshStandardMaterial({color:0x3366ff}));
+  playerObj.position.set(0,0.8,8);
+  scene.add(playerObj);
+
+  // Vehicle (red box) - you can enter/exit
+  vehicleObj = new Mesh(new BoxGeometry(2.2,0.9,4), new MeshStandardMaterial({color:0xff4444}));
+  vehicleObj.position.set(4,0.45,4);
+  vehicleObj.userData.isVehicle = true;
+  scene.add(vehicleObj);
+
+  // NPCs - simple moving boxes
+  const npcMat = new MeshStandardMaterial({color:0xffaa00});
+  for(let i=0;i<12;i++){
+    const n = new Mesh(new BoxGeometry(0.8,1.6,0.6), npcMat.clone());
+    n.position.set((Math.random()-0.5)*80,0.8,(Math.random()-0.5)*80);
+    n.userData.health = 100;
+    n.userData.dir = new Vector3(Math.random()-0.5,0,Math.random()-0.5).normalize();
+    npcs.push(n);
+    scene.add(n);
+  }
+
+  // Camera start behind player
+  camera.position.set(playerObj.position.x, playerObj.position.y + 3.5, playerObj.position.z + 6);
+  camera.lookAt(playerObj.position);
+
+  // Event handlers
+  window.addEventListener('resize', onResize);
+  window.addEventListener('keydown', e => keys[e.code] = true);
+  window.addEventListener('keyup', e => keys[e.code] = false);
+  renderer.domElement.addEventListener('click', requestPointerLock);
+
+  // Mouse look
+  document.addEventListener('pointerlockchange', () => {
+    pointerLocked = !!document.pointerLockElement;
+    document.getElementById('instructions').style.display = pointerLocked ? 'none' : 'block';
+  });
+  document.addEventListener('mousemove', e => {
+    if(!pointerLocked) return;
+    yaw -= e.movementX * mouseSensitivity;
+    pitch -= e.movementY * mouseSensitivity;
+    pitch = Math.max(-1.2, Math.min(1.2, pitch));
+  });
+
+  // Mouse click = shoot
+  document.addEventListener('mousedown', e => {
+    if(e.button === 0) shoot();
+  });
+
+  // Interact (enter/exit vehicle)
+  window.addEventListener('keydown', e => {
+    if(e.code === 'KeyE') {
+      tryToggleEnterVehicle();
+    }
+  });
+
+  updateHUD();
+}
+
+function onResize(){
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+}
+
+function requestPointerLock(){
+  if(!pointerLocked) renderer.domElement.requestPointerLock();
+}
+
+function animate(){
+  requestAnimationFrame(animate);
+  const dt = clock.getDelta();
+  updateDayNight(clock.getElapsedTime());
+  updateNPCs(dt);
+  updatePlayer(dt);
+  renderer.render(scene, camera);
+}
+
+function updateDayNight(t){
+  // 60s cycle for demo
+  const cycle = (t/60) % 1;
+  const angle = cycle * Math.PI * 2;
+  sun.position.set(Math.cos(angle)*60, Math.sin(angle)*60, 30);
+  // sky color shift
+  const dayFactor = Math.max(0, Math.sin(angle));
+  scene.background.setHSL(0.58, 0.7, 0.5 * (0.3 + 0.7*dayFactor));
+  sun.intensity = 0.2 + 1.0 * dayFactor;
+}
+
+function updateNPCs(dt){
+  for(let n of npcs){
+    if(n.userData.health <= 0) continue;
+    // simple wandering
+    n.position.addScaledVector(n.userData.dir, dt * 1.5);
+    // bounce at bounds
+    if(Math.abs(n.position.x) > 180 || Math.abs(n.position.z) > 180) n.userData.dir.negate();
+    // small random steer
+    if(Math.random() < 0.01) {
+      const jitter = new Vector3(Math.random()-0.5,0,Math.random()-0.5).normalize().multiplyScalar(0.5);
+      n.userData.dir.add(jitter).normalize();
+    }
+  }
+}
+
+function updatePlayer(dt){
+  const speedWalk = 6, speedRun = 12;
+  const forward = new Vector3(Math.sin(yaw), 0, Math.cos(yaw)).normalize();
+  const right = new Vector3(Math.sin(yaw + Math.PI/2),0,Math.cos(yaw + Math.PI/2)).normalize();
+
+  if(inVehicle && vehicleObj){
+    // vehicle driving controls when inside
+    let accel = 0;
+    if(keys['KeyW']) accel += 1;
+    if(keys['KeyS']) accel -= 1;
+    if(keys['KeyA']) vehicleObj.rotation.y += dt * 1.2 * (accel!==0?Math.sign(accel):0.6);
+    if(keys['KeyD']) vehicleObj.rotation.y -= dt * 1.2 * (accel!==0?Math.sign(accel):0.6);
+    // simple forward/back movement by translating along local z
+    const dir = new Vector3(0,0, -accel * (keys['ShiftLeft'] ? 18 : 8) * dt);
+    dir.applyAxisAngle(new Vector3(0,1,0), vehicleObj.rotation.y);
+    vehicleObj.position.add(dir);
+    // camera follows vehicle
+    const desired = vehicleObj.position.clone().add(new Vector3(0,2,8).applyAxisAngle(new Vector3(0,1,0), vehicleObj.rotation.y));
+    camera.position.lerp(desired, 0.12);
+    camera.lookAt(vehicleObj.position.clone().add(new Vector3(0,1,0)));
+    document.getElementById('mode').innerText = 'Mode: Vehicle';
+    return;
+  }
+
+  // On foot controls
+  let move = new Vector3(0,0,0);
+  if(keys['KeyW']) move.add(forward);
+  if(keys['KeyS']) move.sub(forward);
+  if(keys['KeyA']) move.sub(right);
+  if(keys['KeyD']) move.add(right);
+  if(move.lengthSq() > 0) move.normalize();
+  const running = !!keys['ShiftLeft'];
+  playerObj.position.addScaledVector(move, dt * (running ? speedRun : speedWalk));
+  // set player orientation to yaw
+  playerObj.rotation.y = yaw;
+  // camera third-person follow (offset behind and above)
+  const camOffset = new Vector3(0, 3.2, 6).applyAxisAngle(new Vector3(0,1,0), yaw);
+  const desiredCam = playerObj.position.clone().add(camOffset);
+  camera.position.lerp(desiredCam, 0.12);
+  const lookAt = playerObj.position.clone().add(new Vector3(0,1.0,0));
+  camera.lookAt(lookAt);
+  document.getElementById('mode').innerText = 'Mode: On Foot';
+}
+
+// Shooting: ray from camera forward, hits NPCs or buildings
+function shoot(){
+  const origin = camera.position.clone();
+  const dir = new Vector3(0,0,-1).applyQuaternion(camera.quaternion).normalize();
+  raycaster.set(origin, dir);
+  const hits = raycaster.intersectObjects(npcs.concat(vehicleObj, playerObj), true);
+  if(hits.length > 0){
+    const h = hits[0].object;
+    if(h.userData && h.userData.health !== undefined){
+      h.userData.health -= 35;
+      flashHit(h);
+      if(h.userData.health <= 0){
+        // destroy NPC
+        h.material.color.set(0x333333);
+        h.userData.dir.set(0,0,0);
+      }
+      document.getElementById('health').innerText = 'Enemy HP: ' + Math.max(0, h.userData.health);
+    } else if(h === vehicleObj){
+      vehicleObj.material.color.set(0x662222);
+    }
+  }
+  // visual tracer (simple)
+  const tracerGeo = new THREE.BufferGeometry().setFromPoints([origin, origin.clone().add(dir.multiplyScalar(60))]);
+  const tracerMat = new THREE.LineBasicMaterial({color:0xffffff});
+  const line = new THREE.Line(tracerGeo, tracerMat);
+  scene.add(line);
+  setTimeout(()=> scene.remove(line), 120);
+}
+
+function flashHit(obj){
+  const old = obj.material.color.clone();
+  obj.material.color.set(0xff0000);
+  setTimeout(()=>{ if(obj.material) obj.material.color.copy(old); }, 150);
+}
+
+function tryToggleEnterVehicle(){
+  // if already in vehicle -> exit near it
+  if(inVehicle){
+    inVehicle = false;
+    // put player beside vehicle
+    const exitPos = vehicleObj.position.clone().add(new Vector3(3,0,0));
+    playerObj.position.copy(exitPos);
+    playerObj.visible = true;
+    updateHUD();
+    return;
+  }
+  // find vehicle within range
+  const d = playerObj.position.distanceTo(vehicleObj.position);
+  if(d < 3.0){
+    inVehicle = true;
+    // hide player
+    playerObj.visible = false;
+    updateHUD();
+    return;
+  }
+  // if not near any vehicle: do nothing
+}
+
+function updateHUD(){
+  document.getElementById('health').innerText = 'Health: 100';
+  document.getElementById('mode').innerText = inVehicle ? 'Mode: Vehicle' : 'Mode: On Foot';
+}
+</script>
+</body>
+</html>
